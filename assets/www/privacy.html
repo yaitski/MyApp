@@ -1,0 +1,7 @@
+<?php
+$page = ROOT_DIR . 'privacy.html';
+if (file_exists($page)) {
+	include $page;
+} else {
+  echo "Политика конфиденциальности не установлена!";
+}

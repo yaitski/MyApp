@@ -1,0 +1,7 @@
+<?php
+$page = ROOT_DIR . 'terms.html';
+if (file_exists($page)) {
+	include $page;
+} else {
+  echo "Пользовательское соглашение не установлено!";
+}
