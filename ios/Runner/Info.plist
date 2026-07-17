@@ -52,5 +52,7 @@
 	<true/>
 	<key>ITSAppUsesNonExemptEncryption</key>
     <false/>
+    <key>NSCameraUsageDescription</key>
+    <string>Доступ к камере нужен для сканирования QR-кодов библиотек.</string>
 </dict>
 </plist>
