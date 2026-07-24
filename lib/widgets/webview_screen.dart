@@ -22,7 +22,10 @@ class _WebViewScreenState extends State<WebViewScreen> {
   String? _currentPage;
   String? _errorMessage;
   bool _isAuthenticated = false;
+  String? _pendingModalPageId;
+  Map<String, dynamic>? _pendingModalParams;
   String? _pendingPageId;
+  Map<String, dynamic>? _pendingPageParams;
 
   // Храним загруженные скрипты
   final Map<String, String> _loadedScripts = {};
@@ -74,7 +77,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageStarted: (String url) {
-            debugPrint('📍 Page started: $url');
+            //debugPrint('📍 Page started: $url');
             if (url != 'about:blank') {
               _isRealPageLoaded = false;
               _scriptsExecuted = false;
@@ -85,7 +88,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
             }
           },
           onPageFinished: (String url) {
-            debugPrint('📍 Page finished: $url');
+            //debugPrint('📍 Page finished: $url');
             if (url != 'about:blank') {
               _isRealPageLoaded = true;
               _currentUrl = url;
@@ -125,7 +128,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
           _handlePasswordRecovery();
           break;
         case 'open_resource':
-          _handleOpenResource();
+          _handleOpenResource(data);
           break;
         case 'page_ready':
           debugPrint('📄 Page ready: ${data['page']}');
@@ -176,10 +179,363 @@ class _WebViewScreenState extends State<WebViewScreen> {
     debugPrint('🔑 Password recovery requested');
   }
 
-  void _handleOpenResource() {
-    debugPrint('🔑 Opening resource...');
+  void _handleOpenResource(Map<String, dynamic> data) {
+    debugPrint('📂 Opening resource...');
+    debugPrint('📂 Data: $data');
+
+    try {
+      // Извлекаем параметры
+      final resourceId = data['resource_id'] as String?;
+      final presentation = data['presentation'] as String? ?? 'page';
+      final params = data['params'] as Map<String, dynamic>? ?? {};
+
+      if (resourceId == null) {
+        debugPrint('❌ Resource ID is null');
+        _sendErrorToJavaScript('open_resource_error', 'Resource ID is required');
+        return;
+      }
+
+      debugPrint('📂 Resource ID: $resourceId');
+      debugPrint('📂 Presentation: $presentation');
+      debugPrint('📂 Params: $params');
+
+      final appState = context.read<AppState>();
+      final manifest = appState.manifest;
+      if (manifest == null) {
+        _sendErrorToJavaScript('open_resource_error', 'Manifest not loaded');
+        return;
+      }
+
+      // Ищем страницу в манифесте по id или route
+      final page = manifest.pages.firstWhere(
+            (p) => p.id == resourceId || p.route == resourceId,
+        orElse: () => manifest.pages.firstWhere(
+              (p) => p.id == 'home',
+          orElse: () => manifest.pages.first,
+        ),
+      );
+
+      debugPrint('📄 Found page: ${page.id} (route: ${page.route})');
+
+      // Проверяем авторизацию для ресурса
+      if (page.requiresAuth && !_isAuthenticated) {
+        debugPrint('🔐 Resource requires auth, redirecting to auth');
+        _pendingPageId = page.id;
+        _loadAuthPage(manifest);
+        return;
+      }
+
+      // Открываем в зависимости от presentation
+      if (presentation == 'modal') {
+        _openResourceAsModal(page, params);
+      } else {
+        _openResourceAsPage(page, params);
+      }
+
+    } catch (e) {
+      debugPrint('❌ Error opening resource: $e');
+      _sendErrorToJavaScript('open_resource_error', 'Error opening resource: $e');
+    }
+  }
+
+  void _openResourceAsModal(dynamic page, Map<String, dynamic> params) {
+    debugPrint('🟨 Opening resource as MODAL: ${page.id}');
+
+    // Сохраняем параметры
+    _pendingModalParams = params;
+    _pendingModalPageId = page.id;
+
+    // Получаем data URL асинхронно
+    _getPageUrl(page).then((dataUrl) {
+      debugPrint('📄 Data URL for modal length: ${dataUrl.length}');
+      _showModalSheet(page, dataUrl);
+    }).catchError((error) {
+      debugPrint('❌ Error getting page URL: $error');
+      _showError('Не удалось загрузить страницу');
+    });
+  }
+
+    // Показываем модальное окно
+  void _showModalSheet(dynamic page, String dataUrl) {
+    // Убедимся, что контекст еще активен
+    if (!mounted) return;
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (BuildContext context) {
+        return Container(
+          height: MediaQuery.of(context).size.height * 0.9,
+          decoration: const BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+          ),
+          child: Column(
+            children: [
+              // Заголовок модального окна
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: const BoxDecoration(
+                  border: Border(
+                    bottom: BorderSide(color: Colors.grey, width: 0.5),
+                  ),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(
+                      page.title ?? 'Modal',
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close),
+                      onPressed: () => Navigator.pop(context),
+                    ),
+                  ],
+                ),
+              ),
+              // Содержимое модального окна
+              Expanded(
+                child: _buildModalWebView(page, dataUrl),
+              ),
+            ],
+          ),
+        );
+      },
+    ).then((_) {
+      debugPrint('🟨 Modal closed: ${page.id}');
+      _pendingModalParams = null;
+      _pendingModalPageId = null;
+      _sendResultToJavaScript('modal_closed', {
+        'resource_id': page.id,
+        'result': 'closed',
+      });
+    }).catchError((error) {
+      debugPrint('❌ Error showing modal: $error');
+    });
+  }
+
+// Создание WebView для модального окна
+  Widget _buildModalWebView(dynamic page, String dataUrl) {
+    debugPrint('🔨 Building modal WebView for: ${page.id}');
+    debugPrint('🔨 Data URL length: ${dataUrl.length}');
+
+    return WebViewWidget(
+      controller: WebViewController()
+        ..setJavaScriptMode(JavaScriptMode.unrestricted)
+        ..addJavaScriptChannel(
+          'ModalApp',
+          onMessageReceived: (JavaScriptMessage message) {
+            debugPrint('📨 Modal message: ${message.message}');
+            try {
+              final data = jsonDecode(message.message) as Map<String, dynamic>;
+              final action = data['action'] as String?;
+
+              if (action == 'close_modal') {
+                Navigator.pop(context);
+              } else if (action == 'modal_result') {
+                Navigator.pop(context, data['result']);
+              }
+            } catch (e) {
+              debugPrint('❌ Error handling modal message: $e');
+            }
+          },
+        )
+        ..setNavigationDelegate(
+          NavigationDelegate(
+            onPageStarted: (String url) {
+              debugPrint('📄 Data URL for modal length: ${dataUrl.length}');
+            },
+            onPageFinished: (String url) {
+              debugPrint('📍 Modal page finished');
+              // После загрузки страницы передаем параметры
+              _injectModalParams(page.id);
+            },
+            onWebResourceError: (WebResourceError error) {
+              debugPrint('❌ Modal error: ${error.description}');
+            },
+          ),
+        )
+      // Загружаем страницу из data URL
+        ..loadRequest(Uri.parse(dataUrl)),
+    );
+  }
+
+  Future<String> _getPageUrl(dynamic page) async {
+    try {
+      final appState = context.read<AppState>();
+      final generation = appState.generation;
+      if (generation == null) {
+        debugPrint('⚠️ Generation is null, using remote URL');
+        return page.url;
+      }
+
+      // Загружаем HTML из кэша
+      final htmlData = await context.read<CacheService>().readResourceFile(
+        page.key,
+        generation,
+      );
+
+      if (htmlData == null) {
+        debugPrint('⚠️ HTML data is null for: ${page.key}, using remote URL');
+        return page.url;
+      }
+
+      // Конвертируем в base64 data URL
+      final base64Html = base64Encode(htmlData);
+      final dataUrl = 'data:text/html;charset=utf-8;base64,$base64Html';
+
+      debugPrint('✅ Loaded page from cache: ${page.key} (${htmlData.length} bytes)');
+      return dataUrl;
+
+    } catch (e) {
+      debugPrint('❌ Error loading HTML from cache: $e');
+      return page.url; // fallback to remote URL
+    }
+  }
+
+  void _openResourceAsPage(dynamic page, Map<String, dynamic> params) {
+    debugPrint('📄 Opening resource as PAGE: ${page.id}');
+
+    // Сохраняем параметры для передачи на страницу
+    _pendingPageParams = params;
+    _pendingPageId = page.id;
+
+    // Загружаем страницу
+    _loadPage(page.id).then((_) {
+      // После загрузки страницы передаем параметры
+      _injectPageParams(page.id);
+    });
+  }
+
+// Инжекция параметров в модальное окно
+  void _injectModalParams(String pageId) {
+    if (_pendingModalParams == null) return;
+
+    final paramsJson = jsonEncode(_pendingModalParams);
+    _controller.runJavaScript('''
+    (function() {
+      try {
+        window.__MODAL_PARAMS__ = $paramsJson;
+        console.log('✅ Modal params injected for $pageId:', window.__MODAL_PARAMS__);
+        
+        // Событие для уведомления страницы о параметрах
+        document.dispatchEvent(new CustomEvent('modal:params', {
+          detail: window.__MODAL_PARAMS__
+        }));
+        
+        // Если есть AuthPage, передаем параметры через него
+        if (window.AuthPage && typeof window.AuthPage.setModalParams === 'function') {
+          window.AuthPage.setModalParams(window.__MODAL_PARAMS__);
+        }
+      } catch (e) {
+        console.error('❌ Error injecting modal params:', e);
+      }
+    })();
+  ''');
+  }
+
+  void _injectPageParams(String pageId) {
+    if (_pendingPageParams == null) return;
+
+    final paramsJson = jsonEncode(_pendingPageParams);
+    _controller.runJavaScript('''
+    (function() {
+      try {
+        window.__PAGE_PARAMS__ = $paramsJson;
+        console.log('✅ Page params injected for $pageId:', window.__PAGE_PARAMS__);
+        
+        // Событие для уведомления страницы о параметрах
+        document.dispatchEvent(new CustomEvent('page:params', {
+          detail: window.__PAGE_PARAMS__
+        }));
+        
+        // Если есть AuthPage, передаем параметры через него
+        if (window.AuthPage && typeof window.AuthPage.setPageParams === 'function') {
+          window.AuthPage.setPageParams(window.__PAGE_PARAMS__);
+        }
+      } catch (e) {
+        console.error('❌ Error injecting page params:', e);
+      }
+    })();
+  ''');
+
+    _pendingPageParams = null;
+  }
 
 
+
+  String _buildModalHtml(dynamic page) {
+    // Здесь нужно загрузить HTML для модального окна
+    // Аналогично _buildHtmlWithCssOnly, но для модального контента
+    // Пока возвращаем простой HTML
+    return '''
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${page.title ?? 'Modal'}</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 20px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+    .close-btn {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      background: none;
+      border: none;
+      font-size: 24px;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <button class="close-btn" onclick="window.ModalApp.postMessage('{\\"action\\":\\"close_modal\\"}')">✕</button>
+  <h1>${page.title ?? 'Modal Content'}</h1>
+  <p>Modal content for ${page.id}</p>
+  <div id="params-display">Waiting for params...</div>
+  
+  <script>
+    // Слушаем событие с параметрами
+    document.addEventListener('modal:params', function(event) {
+      document.getElementById('params-display').textContent = 
+        'Params: ' + JSON.stringify(event.detail, null, 2);
+    });
+    
+    // Проверяем, есть ли уже параметры
+    if (window.__MODAL_PARAMS__) {
+      document.getElementById('params-display').textContent = 
+        'Params: ' + JSON.stringify(window.__MODAL_PARAMS__, null, 2);
+    }
+  </script>
+</body>
+</html>
+  ''';
+  }
+
+  void _sendErrorToJavaScript(String action, String message) {
+    _controller.runJavaScript('''
+    (function() {
+      try {
+        if (window.MobileAppBridge && window.MobileAppBridge.postMessage) {
+          window.MobileAppBridge.postMessage(JSON.stringify({
+            action: '$action',
+            error: '$message'
+          }));
+        }
+      } catch (e) {
+        console.error('Error sending error to JS:', e);
+      }
+    })();
+  ''');
   }
 
   void _sendResultToJavaScript(String function, Map<String, dynamic> data) {
@@ -449,6 +805,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
   }
 
   // Строим HTML ТОЛЬКО с CSS, БЕЗ JS
+  // Строим HTML ТОЛЬКО с CSS, БЕЗ JS (полностью убираем bridgeScript)
   String _buildHtmlWithCssOnly(
       List<int> htmlData,
       List<Map<String, dynamic>> styles,
@@ -458,11 +815,11 @@ class _WebViewScreenState extends State<WebViewScreen> {
     String html = utf8.decode(htmlData);
 
     final headMeta = '''
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-      <meta name="language" content="${languageData['code']}">
-      <meta name="page-id" content="$pageId">
-    ''';
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="language" content="${languageData['code']}">
+    <meta name="page-id" content="$pageId">
+  ''';
 
     // Только CSS
     final styleTags = styles.map((style) {
@@ -470,84 +827,6 @@ class _WebViewScreenState extends State<WebViewScreen> {
       final media = style['media'] as String? ?? 'all';
       return '<style media="$media">$content</style>';
     }).join('\n');
-
-
-    String _escapeJsString(String str) {
-      return str
-          .replaceAll('\\', '\\\\')
-          .replaceAll("'", "\\'")
-          .replaceAll('"', '\\"')
-          .replaceAll('\n', '\\n')
-          .replaceAll('\r', '\\r');
-    }
-    // Минимальный мост для коммуникации с нативным приложением
-    final bridgeScript = '''
-<script>
-  (function() {
-    console.log('🔍 Initializing bridge...');
-    
-    // Проверяем доступные каналы
-    console.log('📌 Available window properties:');
-    console.log('- window.MobileApp:', typeof window.MobileApp);
-    console.log('- window.MobileAppChannel:', typeof window.MobileAppChannel);
-    
-    window.MobileAppBridge = {
-      postMessage: function(message) {
-        try {
-          console.log('📤 Sending to native:', message);
-          
-          // ✅ ИСПРАВЛЕНО: используем ТОЧНО такое же имя, как в addJavaScriptChannel
-          // В вашем случае это 'MobileApp'
-          if (typeof window.MobileApp === 'function') {
-            console.log('✅ Using window.MobileApp as function');
-            window.MobileApp(message);
-            return;
-          }
-          
-          // Если window.MobileApp - это объект с методом postMessage
-          // (для обратной совместимости)
-          if (window.MobileApp && typeof window.MobileApp.postMessage === 'function') {
-            console.log('✅ Using window.MobileApp.postMessage');
-            window.MobileApp.postMessage(message);
-            return;
-          }
-          
-          // Fallback для других случаев
-          if (typeof window.MobileAppChannel === 'function') {
-            console.log('✅ Using MobileAppChannel');
-            window.MobileAppChannel(message);
-            return;
-          }
-          
-          console.error('❌ No bridge found!');
-          console.log('Available:', Object.keys(window).filter(k => k.includes('Mobile') || k.includes('App')));
-        } catch (e) {
-          console.error('❌ Error:', e);
-        }
-      }
-    };
-    
-    // Отправляем сигнал готовности
-    setTimeout(function() {
-      try {
-        if (window.MobileApp && window.MobileApp.postMessage) {
-          window.MobileApp.postMessage(JSON.stringify({
-            action: 'page_ready',
-            page: '${_escapeJsString(pageId)}',
-            timestamp: Date.now()
-          }));
-        }
-      } catch (e) {
-        console.error('Ready error:', e);
-      }
-    }, 500);
-    
-    console.log('✅ Bridge initialized');
-  })();
-</script>
-''';
-
-
 
     String modifiedHtml = html;
 
@@ -566,15 +845,68 @@ class _WebViewScreenState extends State<WebViewScreen> {
       modifiedHtml = '<!DOCTYPE html><html><head>$headMeta</head><body>$modifiedHtml</body></html>';
     }
 
-    // Добавляем CSS и мост в head (БЕЗ JS СКРИПТОВ!)
+    // Добавляем ТОЛЬКО CSS (без JavaScript!)
     if (modifiedHtml.contains('</head>')) {
       modifiedHtml = modifiedHtml.replaceFirst(
         '</head>',
-        '$styleTags$bridgeScript</head>',
+        '$styleTags</head>',
       );
     }
 
     return modifiedHtml;
+  }
+
+  // Инициализация JavaScript моста через runJavaScript
+  Future<void> _initializeJavaScriptBridge() async {
+    try {
+      await _controller.runJavaScript('''
+      (function() {
+        console.log('🔍 Initializing JavaScript bridge via runJavaScript...');
+        
+        // Создаем мост для коммуникации с нативным приложением
+        window.MobileAppBridge = {
+          postMessage: function(message) {
+            try {
+              console.log('📤 Sending to native:', message);
+              
+              // Используем канал, зарегистрированный в addJavaScriptChannel
+              if (typeof window.MobileApp === 'function') {
+                console.log('✅ Using window.MobileApp as function');
+                window.MobileApp(message);
+                return true;
+              }
+              
+              if (window.MobileApp && typeof window.MobileApp.postMessage === 'function') {
+                console.log('✅ Using window.MobileApp.postMessage');
+                window.MobileApp.postMessage(message);
+                return true;
+              }
+              
+              console.error('❌ No bridge found!');
+              return false;
+            } catch (e) {
+              console.error('❌ Error in postMessage:', e);
+              return false;
+            }
+          }
+        };
+        
+        // Перехватываем сообщения от страницы через событие
+        document.addEventListener('sendToNative', function(event) {
+          if (event.detail && event.detail.message) {
+            window.MobileAppBridge.postMessage(event.detail.message);
+          }
+        });
+        
+        console.log('✅ JavaScript bridge initialized');
+        console.log('📌 window.MobileAppBridge available:', typeof window.MobileAppBridge);
+      })();
+    ''');
+
+      debugPrint('✅ JavaScript bridge initialized successfully');
+    } catch (e) {
+      debugPrint('❌ Error initializing JavaScript bridge: $e');
+    }
   }
 
   // Выполнение скриптов через runJavaScript
@@ -597,6 +929,9 @@ class _WebViewScreenState extends State<WebViewScreen> {
     debugPrint('📜 Executing ${_loadedScripts.length} scripts via runJavaScript...');
     debugPrint('📍 Current URL: $_currentUrl');
 
+    // Сначала инициализируем мост
+    await _initializeJavaScriptBridge();
+
     final sortedKeys = _loadedScripts.keys.toList();
 
     for (final scriptId in sortedKeys) {
@@ -615,26 +950,41 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
       try {
         await _controller.runJavaScript('''
-          (function() {
-            try {
-              // Проверяем готовность документа
-              if (document.readyState !== 'complete') {
-                console.warn('⚠️ Document not ready for script: $scriptId');
-              }
-              ${content}
-              console.log('✅ Script executed: $scriptId');
-            } catch (e) {
-              console.error('❌ Script error: $scriptId', e.message || String(e));
-              if (window.MobileApp) {
-                window.MobileApp.postMessage({
-                  action: 'script_error',
-                  script: '$scriptId',
-                  error: e.message || String(e)
-                });
-              }
+        (function() {
+          try {
+            // Проверяем готовность документа
+            if (document.readyState !== 'complete') {
+              console.warn('⚠️ Document not ready for script: $scriptId');
             }
-          })();
-        ''');
+            
+            // Добавляем обертку для window.MobileApp, если его нет
+            if (typeof window.MobileApp === 'undefined') {
+              window.MobileApp = function(message) {
+                if (window.MobileAppBridge && window.MobileAppBridge.postMessage) {
+                  window.MobileAppBridge.postMessage(message);
+                } else {
+                  console.warn('⚠️ MobileAppBridge not ready for message:', message);
+                }
+              };
+              console.log('✅ window.MobileApp wrapper created');
+            }
+            
+            // Выполняем скрипт
+            ${content}
+            console.log('✅ Script executed: $scriptId');
+          } catch (e) {
+            console.error('❌ Script error: $scriptId', e.message || String(e));
+            if (window.MobileAppBridge && window.MobileAppBridge.postMessage) {
+              window.MobileAppBridge.postMessage(JSON.stringify({
+                action: 'script_error',
+                script: '$scriptId',
+                error: e.message || String(e)
+              }));
+            }
+          }
+        })();
+      ''');
+
         _executedScripts.add(scriptId);
         debugPrint('✅ Script executed: $scriptId');
 
@@ -664,12 +1014,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
       final languageService = context.read<LanguageService>();
       final selectedLang = await languageService.getSelectedLanguage(manifest);
 
-      /*final translations = await languageService.loadTranslations(
-        selectedLang,
-        manifest,
-      );*/
       final Map<String, dynamic> allPackages = {};
-      //Map<String, dynamic> fallbackTranslations = {};
       for (final language in manifest.languages) {
         try {
           final translations = await languageService.loadTranslations(
@@ -700,38 +1045,55 @@ class _WebViewScreenState extends State<WebViewScreen> {
         },
         'current_language': selectedLang,
         'packages': allPackages,
-        //'packages': {
-        // selectedLang: translations,
-        //  if (manifest.fallbackLanguage != selectedLang)
-        //   manifest.fallbackLanguage: fallbackTranslations,
-        //},
       };
 
       final languageJson = jsonEncode(languageData);
 
+      // Проверяем наличие window.MobileAppBridge перед отправкой
       await _controller.runJavaScript('''
-        (function() {
-          try {
-            console.log('📚 Initializing I18n with pre-loaded packages...');
-            
-            var languageData = $languageJson;
-            window.AuthPage.bootstrap({
-                  manifest: languageData.manifest,
-                  current_language: languageData.current_language,
-                  language_packages: languageData.packages
-                });
-            console.log('✅Done');
-console.log(JSON.stringify({
-    manifest: languageData.manifest,
-    current_language: languageData.current_language,
-    language_packages: languageData.packages
-}, null, 2));
-            
-          } catch (e) {
-            console.error('❌ Error initializing page features:', e);
+      (function() {
+        try {
+          console.log('📚 Initializing I18n with pre-loaded packages...');
+          
+          // Проверяем, что мост существует
+          if (!window.MobileAppBridge) {
+            console.error('❌ MobileAppBridge not initialized!');
+            // Создаем fallback
+            window.MobileAppBridge = {
+              postMessage: function(message) {
+                console.warn('⚠️ Fallback bridge used:', message);
+              }
+            };
           }
-        })();
-      ''');
+          
+          var languageData = $languageJson;
+          
+          // Инициализируем AuthPage, если он существует
+          if (window.AuthPage && typeof window.AuthPage.bootstrap === 'function') {
+            window.AuthPage.bootstrap({
+              manifest: languageData.manifest,
+              current_language: languageData.current_language,
+              language_packages: languageData.packages
+            });
+            console.log('✅ AuthPage initialized');
+          } else {
+            console.warn('⚠️ AuthPage not found or bootstrap method missing');
+          }
+          
+          console.log('✅ Page features initialized');
+        } catch (e) {
+          console.error('❌ Error initializing page features:', e);
+          
+          // Отправляем ошибку в нативное приложение
+          if (window.MobileAppBridge && window.MobileAppBridge.postMessage) {
+            window.MobileAppBridge.postMessage(JSON.stringify({
+              action: 'init_error',
+              error: e.message || String(e)
+            }));
+          }
+        }
+      })();
+    ''');
 
       debugPrint('✅ Page features initialized with language: $selectedLang');
     } catch (e) {
@@ -741,7 +1103,8 @@ console.log(JSON.stringify({
 
   // Обновление языка через runJavaScript
   Future<void> _updateLanguage(String languageCode) async {
-    debugPrint('___Started update Language___');
+    debugPrint('🔄 Updating language to: $languageCode');
+
     final appState = context.read<AppState>();
     final manifest = appState.manifest;
     if (manifest == null) return;
@@ -753,7 +1116,6 @@ console.log(JSON.stringify({
         manifest,
       );
 
-      // Получаем fallback переводы, если нужны
       Map<String, dynamic> fallbackTranslations = {};
       if (manifest.fallbackLanguage != languageCode) {
         fallbackTranslations = await languageService.loadTranslations(
@@ -762,7 +1124,6 @@ console.log(JSON.stringify({
         );
       }
 
-      // Формируем полные данные для JavaScript
       final languageData = {
         'manifest': {
           'default_language': manifest.defaultLanguage,
@@ -788,7 +1149,6 @@ console.log(JSON.stringify({
 
       final languageJson = jsonEncode(languageData);
 
-      // Отправляем ВСЕ данные в JavaScript
       await _controller.runJavaScript('''
       (function() {
         try {
@@ -796,26 +1156,44 @@ console.log(JSON.stringify({
           
           var languageData = $languageJson;
           
-          // Проверяем, существует ли MiniAppI18n
-          if (window.MiniAppI18n) {
-            // Обновляем язык с полными данными
+          // Обновляем через MiniAppI18n, если он существует
+          if (window.MiniAppI18n && typeof window.MiniAppI18n.setLanguage === 'function') {
             window.MiniAppI18n.setLanguage('$languageCode', languageData)
               .then(function() {
-                console.log('✅ Language updated to: $languageCode');
-                
-                // Обновляем AuthPage если есть
-                if (window.AuthPage && window.AuthPage.applyLanguage) {
-                  window.AuthPage.applyLanguage('$languageCode', languageData.packages['$languageCode']);
-                }
+                console.log('✅ Language updated via MiniAppI18n');
               })
               .catch(function(e) {
-                console.error('❌ Language change error:', e);
+                console.error('❌ MiniAppI18n error:', e);
               });
-          } else {
-            console.warn('⚠️ MiniAppI18n not found');
           }
+          
+          // Обновляем AuthPage, если он существует
+          if (window.AuthPage && typeof window.AuthPage.applyLanguage === 'function') {
+            window.AuthPage.applyLanguage('$languageCode', languageData.packages['$languageCode']);
+            console.log('✅ AuthPage updated');
+          }
+          
+          // Отправляем подтверждение в нативное приложение
+          if (window.MobileAppBridge && window.MobileAppBridge.postMessage) {
+            window.MobileAppBridge.postMessage(JSON.stringify({
+              action: 'language_updated',
+              language: '$languageCode',
+              timestamp: Date.now()
+            }));
+          }
+          
+          console.log('✅ Language updated successfully');
         } catch (e) {
           console.error('❌ Error updating language:', e);
+          
+          // Отправляем ошибку в нативное приложение
+          if (window.MobileAppBridge && window.MobileAppBridge.postMessage) {
+            window.MobileAppBridge.postMessage(JSON.stringify({
+              action: 'language_update_error',
+              language: '$languageCode',
+              error: e.message || String(e)
+            }));
+          }
         }
       })();
     ''');
