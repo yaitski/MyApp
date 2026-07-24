@@ -44,6 +44,7 @@ dependencies:
   path_provider: ^2.1.0
   crypto: ^3.0.3
   path: ^1.9.0
+  provider: ^6.0.5
 
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
@@ -72,6 +73,7 @@ flutter:
   uses-material-design: true
   assets:
     - assets/images/avdicon.png
+    - assets/www/
 # Для iOS 14+
 ios:
   min-version: '14.0'
